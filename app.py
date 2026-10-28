@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
+
+
+st.set_page_config(
+    page_title="Analizador de cuadrícula 2×2",
+    page_icon="▦",
+    layout="wide",
+)
+
+st.title("Analizador de imágenes · Cuadrícula 2×2")
+st.markdown(
+    "Mueve los ejes vertical y horizontal para dividir la imagen en cuatro regiones "
+    "de tamaños distintos y observa cómo cambian sus estadísticas."
+)
+st.caption(
+    "La desviación estándar se calcula sobre la luminancia de cada píxel, "
+    "en una escala aproximada de 0 a 255. También se muestran las desviaciones "
+    "de los canales RGB."
+)
+
+
+@st.cache_data(show_spinner=False)
+def decode_image(image_bytes: bytes) -> np.ndarray:
+    """Decode an uploaded image and return an RGB array."""
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        return np.asarray(image, dtype=np.uint8)
+
+
+def get_luminance(rgb: np.ndarray) -> np.ndarray:
+    """Approximate perceived luminance using the RGB components."""
+    values = rgb.astype(np.float32)
+    return (
+        0.2126 * values[..., 0]
+        + 0.7152 * values[..., 1]
+        + 0.0722 * values[..., 2]
+    )
+
+
+def region_metrics(region: np.ndarray, name: str) -> dict[str, float | int | str]:
+    """Compute descriptive intensity statistics for an RGB region."""
+    luminance = get_luminance(region)
+    row: dict[str, float | int | str] = {
+        "Región": name,
+        "Ancho (px)": int(region.shape[1]),
+        "Alto (px)": int(region.shape[0]),
+        "Píxeles": int(region.shape[0] * region.shape[1]),
+        "Área (%)": 100.0 * region.shape[0] * region.shape[1] / (image_height * image_width),
+        "Media luminancia": float(np.mean(luminance)),
+        "Desv. estándar luminancia": float(np.std(luminance)),
+        "Mín. luminancia": float(np.min(luminance)),
+        "Máx. luminancia": float(np.max(luminance)),
+        "Desv. estándar R": float(np.std(region[..., 0].astype(np.float32))),
+        "Desv. estándar G": float(np.std(region[..., 1].astype(np.float32))),
+        "Desv. estándar B": float(np.std(region[..., 2].astype(np.float32))),
+    }
+    return row
+
+
+def reset_axes() -> None:
+    """Reset both sliders before their widgets are rendered on the next rerun."""
+    st.session_state["x_percent"] = 50
+    st.session_state["y_percent"] = 50
+
+
+def add_grid_overlay(rgb: np.ndarray, x_cut: int, y_cut: int) -> Image.Image:
+    """Draw visible, high-contrast grid axes over a copy of the image."""
+    image = Image.fromarray(rgb.copy())
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    thickness = max(2, round(min(width, height) / 350))
+    # A dark outline keeps the bright axis visible on light image areas.
+    for offset in range(-thickness, thickness + 1):
+        xx = max(0, min(width - 1, x_cut + offset))
+        yy = max(0, min(height - 1, y_cut + offset))
+        draw.line((xx, 0, xx, height - 1), fill=(20, 20, 20), width=1)
+        draw.line((0, yy, width - 1, yy), fill=(20, 20, 20), width=1)
+    draw.line((x_cut, 0, x_cut, height - 1), fill=(255, 70, 70), width=thickness)
+    draw.line((0, y_cut, width - 1, y_cut), fill=(255, 70, 70), width=thickness)
+    return image
+
+
+uploaded = st.file_uploader(
+    "Carga una imagen",
+    type=["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"],
+    help="Se admiten imágenes a color. Los cálculos se hacen sobre la imagen completa, no sobre la vista reducida.",
+)
+
+if uploaded is None:
+    st.info("Carga una imagen para comenzar. Después podrás mover los dos ejes de la cuadrícula 2×2.")
+    st.markdown(
+        "**Cómo funciona:** el eje vertical determina la separación izquierda/derecha y el horizontal "
+        "determina la separación superior/inferior. Cada cambio vuelve a calcular las métricas."
+    )
+    st.stop()
+
+try:
+    rgb = decode_image(uploaded.getvalue())
+except (UnidentifiedImageError, OSError, ValueError) as exc:
+    st.error(f"No fue posible leer la imagen. Prueba con otro archivo. Detalle: {exc}")
+    st.stop()
+
+image_height, image_width = rgb.shape[:2]
+if image_height < 2 or image_width < 2:
+    st.error("La imagen debe tener al menos 2 píxeles de ancho y 2 de alto para dividirse en cuatro regiones.")
+    st.stop()
+
+st.caption(f"Imagen: **{uploaded.name}** · Dimensiones: **{image_width} × {image_height} px**")
+
+control_col1, control_col2, reset_col = st.columns([2, 2, 1])
+with control_col1:
+    x_percent = st.slider(
+        "Eje vertical · separación izquierda/derecha (%)",
+        min_value=1,
+        max_value=99,
+        value=50,
+        step=1,
+        help="Un porcentaje pequeño crea regiones izquierdas más estrechas; uno grande crea regiones derechas más estrechas.",
+        key="x_percent",
+    )
+with control_col2:
+    y_percent = st.slider(
+        "Eje horizontal · separación arriba/abajo (%)",
+        min_value=1,
+        max_value=99,
+        value=50,
+        step=1,
+        help="Un porcentaje pequeño crea una franja superior más baja; uno grande crea una franja inferior más baja.",
+        key="y_percent",
+    )
+with reset_col:
+    st.write(" ")
+    st.button("Centrar ejes", use_container_width=True, on_click=reset_axes)
+
+x_cut = int(round(image_width * x_percent / 100.0))
+y_cut = int(round(image_height * y_percent / 100.0))
+x_cut = max(1, min(image_width - 1, x_cut))
+y_cut = max(1, min(image_height - 1, y_cut))
+
+left_width = x_cut
+right_width = image_width - x_cut
+top_height = y_cut
+bottom_height = image_height - y_cut
+
+regions: list[tuple[str, np.ndarray]] = [
+    ("Superior izquierda", rgb[:y_cut, :x_cut]),
+    ("Superior derecha", rgb[:y_cut, x_cut:]),
+    ("Inferior izquierda", rgb[y_cut:, :x_cut]),
+    ("Inferior derecha", rgb[y_cut:, x_cut:]),
+]
+
+# `region_metrics` uses the full image dimensions to calculate area percentages.
+metrics = pd.DataFrame([region_metrics(region, name) for name, region in regions])
+
+preview_col, info_col = st.columns([1.45, 1])
+with preview_col:
+    st.subheader("Imagen y ejes")
+    overlay = add_grid_overlay(rgb, x_cut, y_cut)
+    st.image(overlay, use_container_width=True)
+    st.caption(
+        f"Eje vertical: x = {x_cut} px ({x_percent} %) · "
+        f"Eje horizontal: y = {y_cut} px ({y_percent} %). "
+        "Las líneas rojas marcan los cortes."
+    )
+with info_col:
+    st.subheader("Desviación estándar por región")
+    st.markdown("La desviación estándar mide cuánto varían los niveles de intensidad dentro de cada región.")
+    for _, row in metrics.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**{row['Región']}**")
+            metric_col1, metric_col2 = st.columns(2)
+            metric_col1.metric("Desv. luminancia", f"{row['Desv. estándar luminancia']:.2f}")
+            metric_col2.metric("Media luminancia", f"{row['Media luminancia']:.2f}")
+            st.caption(
+                f"Tamaño: {int(row['Ancho (px)'])} × {int(row['Alto (px)'])} px · "
+                f"Área: {row['Área (%)']:.1f} % · "
+                f"Desv. RGB: {row['Desv. estándar R']:.2f} / "
+                f"{row['Desv. estándar G']:.2f} / {row['Desv. estándar B']:.2f}"
+            )
+
+st.subheader("Tabla comparativa")
+columns_to_show = [
+    "Región", "Ancho (px)", "Alto (px)", "Píxeles", "Área (%)",
+    "Media luminancia", "Desv. estándar luminancia", "Mín. luminancia", "Máx. luminancia",
+    "Desv. estándar R", "Desv. estándar G", "Desv. estándar B",
+]
+formatted = metrics[columns_to_show].copy()
+formatted["Área (%)"] = formatted["Área (%)"].map(lambda v: f"{v:.2f}")
+for col in [
+    "Media luminancia", "Desv. estándar luminancia", "Mín. luminancia", "Máx. luminancia",
+    "Desv. estándar R", "Desv. estándar G", "Desv. estándar B",
+]:
+    formatted[col] = formatted[col].map(lambda v: f"{v:.3f}")
+st.dataframe(formatted, hide_index=True, use_container_width=True)
+
+show_histograms = st.checkbox("Mostrar histogramas de luminancia por región", value=False)
+if show_histograms:
+    histogram_data: dict[str, np.ndarray] = {}
+    for name, region in regions:
+        luminance = np.clip(np.rint(get_luminance(region)), 0, 255).astype(np.uint8)
+        histogram_data[name] = np.bincount(luminance.ravel(), minlength=256)
+    hist_df = pd.DataFrame(histogram_data, index=np.arange(256))
+    hist_df.index.name = "Luminancia"
+    st.line_chart(hist_df, x_label="Nivel de luminancia (0–255)", y_label="Cantidad de píxeles")
+
+st.subheader("Descargas")
+csv_bytes = metrics.to_csv(index=False, float_format="%.6f").encode("utf-8-sig")
+image_buffer = BytesIO()
+overlay.save(image_buffer, format="PNG")
+download_col1, download_col2 = st.columns(2)
+with download_col1:
+    st.download_button(
+        "Descargar métricas (CSV)",
+        data=csv_bytes,
+        file_name="metricas_cuadricula_2x2.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with download_col2:
+    st.download_button(
+        "Descargar imagen con cuadrícula (PNG)",
+        data=image_buffer.getvalue(),
+        file_name="imagen_cuadricula_2x2.png",
+        mime="image/png",
+        use_container_width=True,
+    )
+
+with st.expander("Definición de las métricas"):
+    st.latex(r"Y = 0.2126R + 0.7152G + 0.0722B")
+    st.latex(r"\sigma_Y = \sqrt{\frac{1}{N}\sum_{i=1}^{N}(Y_i-\bar{Y})^2}")
+    st.markdown(
+        "La desviación estándar se calcula como desviación **poblacional** (divisor `N`), "
+        "porque se consideran todos los píxeles de la región analizada. Una desviación mayor "
+        "indica más dispersión de intensidades, pero no garantiza por sí sola una mejor calidad visual. "
+        "Las desviaciones RGB se calculan por separado para cada canal."
+    )
