@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
 
 import altair as alt
 import numpy as np
@@ -189,6 +190,68 @@ def deviation_curve(
     return curve
 
 
+def strongest_derivative_by_region(
+    luminance: np.ndarray,
+    axis: str,
+    x_cut: int,
+    y_cut: int,
+) -> tuple[int, dict[str, object]]:
+    """Choose an axis position from the strongest derivative location in each region.
+
+    For each of the four regions, locate the interval with the largest absolute
+    finite-difference derivative. The four interval midpoints are then summarized:
+    median if their population standard deviation is < 20 percentage points,
+    otherwise mean. The returned position is rounded to the nearest slider value.
+    """
+    peak_rows: list[dict[str, float | int | str]] = []
+
+    for region_number in range(1, 5):
+        curve = deviation_curve(luminance, axis, region_number, x_cut, y_cut)
+        curve = curve.sort_values("Separación (%)").reset_index(drop=True)
+        positions = curve["Separación (%)"].to_numpy(dtype=float)
+        deviations = curve["Desviación estándar"].to_numpy(dtype=float)
+
+        slopes = np.diff(deviations) / np.diff(positions)
+        interval_index = int(np.argmax(np.abs(slopes)))
+        start = float(positions[interval_index])
+        end = float(positions[interval_index + 1])
+        peak_position = (start + end) / 2.0
+        slope = float(slopes[interval_index])
+
+        peak_rows.append(
+            {
+                "Eje analizado": axis,
+                "Cuadrícula": region_number,
+                "Intervalo (%)": f"{start:.0f}–{end:.0f}",
+                "Posición del cambio (%)": peak_position,
+                "Derivada aproximada": slope,
+                "Valor absoluto de la derivada": abs(slope),
+            }
+        )
+
+    peak_positions = np.array(
+        [row["Posición del cambio (%)"] for row in peak_rows], dtype=float
+    )
+    spread = float(np.std(peak_positions))
+    if spread < 20.0:
+        method = "Mediana (desviación < 20)"
+        summary_value = float(np.median(peak_positions))
+    else:
+        method = "Media (desviación ≥ 20)"
+        summary_value = float(np.mean(peak_positions))
+
+    recommended_position = int(np.clip(np.rint(summary_value), 1, 99))
+    return recommended_position, {
+        "eje": axis,
+        "picos": peak_rows,
+        "posiciones": peak_positions.tolist(),
+        "desviacion_posiciones": spread,
+        "metodo": method,
+        "valor_resumen": summary_value,
+        "posicion_recomendada": recommended_position,
+    }
+
+
 uploaded = st.file_uploader(
     "Carga una imagen",
     type=["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"],
@@ -216,13 +279,59 @@ if image_height < 2 or image_width < 2:
 
 st.caption(f"Imagen: **{uploaded.name}** · Dimensiones: **{image_width} × {image_height} px**")
 
+# Defaults are set before the sliders are created so the automatic button can
+# update their values safely during this run.
+st.session_state.setdefault("x_percent", 50)
+st.session_state.setdefault("y_percent", 50)
+
+# Avoid displaying a previous image's automatic-adjustment report after uploading another image.
+image_token = hashlib.sha256(uploaded.getvalue()).hexdigest()
+if st.session_state.get("auto_image_token") != image_token:
+    st.session_state.pop("auto_axis_result", None)
+    st.session_state["auto_image_token"] = image_token
+
+button_col, explanation_col = st.columns([1, 2.4])
+with button_col:
+    if st.button(
+        "Ajustar ejes automáticamente",
+        type="primary",
+        use_container_width=True,
+        help="Busca en cada región el intervalo con mayor cambio absoluto y combina las cuatro posiciones detectadas.",
+    ):
+        auto_luminance = get_luminance(rgb)
+        current_x = int(st.session_state.get("x_percent", 50))
+        current_y = int(st.session_state.get("y_percent", 50))
+        current_x_cut = int(np.clip(round(image_width * current_x / 100.0), 1, image_width - 1))
+        current_y_cut = int(np.clip(round(image_height * current_y / 100.0), 1, image_height - 1))
+
+        recommended_x, vertical_result = strongest_derivative_by_region(
+            auto_luminance, "Eje vertical", current_x_cut, current_y_cut
+        )
+        recommended_y, horizontal_result = strongest_derivative_by_region(
+            auto_luminance, "Eje horizontal", current_x_cut, current_y_cut
+        )
+
+        st.session_state["x_percent"] = recommended_x
+        st.session_state["y_percent"] = recommended_y
+        st.session_state["auto_axis_result"] = {
+            "vertical": vertical_result,
+            "horizontal": horizontal_result,
+            "image_token": image_token,
+        }
+with explanation_col:
+    st.caption(
+        "Para cada una de las cuatro regiones, detecta el cambio más brusco (máximo |derivada|). "
+        "Si la desviación estándar de las cuatro posiciones detectadas es menor que 20 puntos porcentuales, "
+        "usa su mediana; de lo contrario, usa su media. Cada eje se calcula manteniendo fijo el otro "
+        "en su posición anterior al ajuste."
+    )
+
 control_col1, control_col2, reset_col = st.columns([2, 2, 1])
 with control_col1:
     x_percent = st.slider(
         "Eje vertical · separación izquierda/derecha (%)",
         min_value=1,
         max_value=99,
-        value=50,
         step=1,
         help="Un porcentaje pequeño crea regiones izquierdas más estrechas; uno grande crea regiones derechas más estrechas.",
         key="x_percent",
@@ -232,7 +341,6 @@ with control_col2:
         "Eje horizontal · separación arriba/abajo (%)",
         min_value=1,
         max_value=99,
-        value=50,
         step=1,
         help="Un porcentaje pequeño crea una franja superior más baja; uno grande crea una franja inferior más baja.",
         key="y_percent",
@@ -250,6 +358,36 @@ regions: list[tuple[str, np.ndarray]] = [
     ("Cuadrícula 3 · Inferior izquierda", rgb[y_cut:, :x_cut]),
     ("Cuadrícula 4 · Inferior derecha", rgb[y_cut:, x_cut:]),
 ]
+
+if st.session_state.get("auto_axis_result", {}).get("image_token") == image_token:
+    automatic_result = st.session_state["auto_axis_result"]
+    with st.expander("Detalle del ajuste automático", expanded=True):
+        result_col1, result_col2 = st.columns(2)
+        for column, key, title, current_value in [
+            (result_col1, "vertical", "Eje vertical", x_percent),
+            (result_col2, "horizontal", "Eje horizontal", y_percent),
+        ]:
+            details = automatic_result[key]
+            with column:
+                st.markdown(f"**{title}: {current_value} %**")
+                st.caption(
+                    f"Posiciones de los cuatro picos: "
+                    f"{', '.join(f'{value:.1f} %' for value in details['posiciones'])}. "
+                    f"Desviación estándar de las posiciones: {details['desviacion_posiciones']:.2f}. "
+                    f"Criterio aplicado: {details['metodo']}; valor antes de redondear: "
+                    f"{details['valor_resumen']:.2f} %."
+                )
+        all_peak_rows = (
+            automatic_result["vertical"]["picos"]
+            + automatic_result["horizontal"]["picos"]
+        )
+        peak_table = pd.DataFrame(all_peak_rows)
+        peak_table["Posición del cambio (%)"] = peak_table["Posición del cambio (%)"].map(
+            lambda value: f"{value:.1f}"
+        )
+        for numeric_col in ["Derivada aproximada", "Valor absoluto de la derivada"]:
+            peak_table[numeric_col] = peak_table[numeric_col].map(lambda value: f"{value:.4f}")
+        st.dataframe(peak_table, hide_index=True, use_container_width=True)
 
 metrics = pd.DataFrame(
     [
