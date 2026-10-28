@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -44,15 +45,18 @@ def get_luminance(rgb: np.ndarray) -> np.ndarray:
     )
 
 
-def region_metrics(region: np.ndarray, name: str) -> dict[str, float | int | str]:
+def region_metrics(
+    region: np.ndarray, name: str, image_height: int, image_width: int
+) -> dict[str, float | int | str]:
     """Compute descriptive intensity statistics for an RGB region."""
     luminance = get_luminance(region)
+    region_height, region_width = region.shape[:2]
     row: dict[str, float | int | str] = {
         "Región": name,
-        "Ancho (px)": int(region.shape[1]),
-        "Alto (px)": int(region.shape[0]),
-        "Píxeles": int(region.shape[0] * region.shape[1]),
-        "Área (%)": 100.0 * region.shape[0] * region.shape[1] / (image_height * image_width),
+        "Ancho (px)": int(region_width),
+        "Alto (px)": int(region_height),
+        "Píxeles": int(region_height * region_width),
+        "Área (%)": 100.0 * region_height * region_width / (image_height * image_width),
         "Media luminancia": float(np.mean(luminance)),
         "Desv. estándar luminancia": float(np.std(luminance)),
         "Mín. luminancia": float(np.min(luminance)),
@@ -76,7 +80,6 @@ def add_grid_overlay(rgb: np.ndarray, x_cut: int, y_cut: int) -> Image.Image:
     draw = ImageDraw.Draw(image)
     width, height = image.size
     thickness = max(2, round(min(width, height) / 350))
-    # A dark outline keeps the bright axis visible on light image areas.
     for offset in range(-thickness, thickness + 1):
         xx = max(0, min(width - 1, x_cut + offset))
         yy = max(0, min(height - 1, y_cut + offset))
@@ -87,17 +90,116 @@ def add_grid_overlay(rgb: np.ndarray, x_cut: int, y_cut: int) -> Image.Image:
     return image
 
 
+def cut_positions(percentages: np.ndarray, size: int) -> np.ndarray:
+    """Convert percentages into valid pixel cut positions."""
+    cuts = np.rint(size * percentages / 100.0).astype(int)
+    return np.clip(cuts, 1, size - 1)
+
+
+def standard_deviation_from_sums(
+    sums: np.ndarray, sums_squared: np.ndarray, counts: np.ndarray
+) -> np.ndarray:
+    """Calculate population standard deviations from sums and squared sums."""
+    means = sums / counts
+    variances = sums_squared / counts - means**2
+    # Floating-point arithmetic can produce tiny negative values for near-constant data.
+    return np.sqrt(np.maximum(variances, 0.0))
+
+
+def deviation_curve(
+    luminance: np.ndarray,
+    axis: str,
+    region_number: int,
+    x_cut: int,
+    y_cut: int,
+) -> pd.DataFrame:
+    """Calculate the selected region's deviation across all slider positions.
+
+    The other axis stays fixed. Column/row aggregates and cumulative sums avoid
+    recalculating every complete region for each of the 99 possible positions.
+    """
+    height, width = luminance.shape
+    percentages = np.arange(1, 100, dtype=int)
+
+    if axis == "Eje vertical":
+        # The horizontal axis is fixed; summarize each column in its top/bottom band.
+        if region_number in (1, 2):
+            band = luminance[:y_cut, :]
+            band_height = y_cut
+        else:
+            band = luminance[y_cut:, :]
+            band_height = height - y_cut
+
+        column_sums = np.sum(band, axis=0, dtype=np.float64)
+        column_squares = np.sum(band * band, axis=0, dtype=np.float64)
+        prefix_sums = np.concatenate(([0.0], np.cumsum(column_sums, dtype=np.float64)))
+        prefix_squares = np.concatenate(([0.0], np.cumsum(column_squares, dtype=np.float64)))
+
+        cuts = cut_positions(percentages, width)
+        if region_number in (1, 3):  # left-hand regions
+            sums = prefix_sums[cuts]
+            sums_squared = prefix_squares[cuts]
+            region_widths = cuts
+        else:  # right-hand regions
+            sums = prefix_sums[-1] - prefix_sums[cuts]
+            sums_squared = prefix_squares[-1] - prefix_squares[cuts]
+            region_widths = width - cuts
+        counts = region_widths.astype(np.float64) * band_height
+        deviations = standard_deviation_from_sums(sums, sums_squared, counts)
+        current_percent = int(st.session_state["x_percent"])
+        axis_label = "Separación del eje vertical (%)"
+
+    else:
+        # The vertical axis is fixed; summarize each row in its left/right band.
+        if region_number in (1, 3):
+            band = luminance[:, :x_cut]
+            band_width = x_cut
+        else:
+            band = luminance[:, x_cut:]
+            band_width = width - x_cut
+
+        row_sums = np.sum(band, axis=1, dtype=np.float64)
+        row_squares = np.sum(band * band, axis=1, dtype=np.float64)
+        prefix_sums = np.concatenate(([0.0], np.cumsum(row_sums, dtype=np.float64)))
+        prefix_squares = np.concatenate(([0.0], np.cumsum(row_squares, dtype=np.float64)))
+
+        cuts = cut_positions(percentages, height)
+        if region_number in (1, 2):  # top regions
+            sums = prefix_sums[cuts]
+            sums_squared = prefix_squares[cuts]
+            region_heights = cuts
+        else:  # bottom regions
+            sums = prefix_sums[-1] - prefix_sums[cuts]
+            sums_squared = prefix_squares[-1] - prefix_squares[cuts]
+            region_heights = height - cuts
+        counts = region_heights.astype(np.float64) * band_width
+        deviations = standard_deviation_from_sums(sums, sums_squared, counts)
+        current_percent = int(st.session_state["y_percent"])
+        axis_label = "Separación del eje horizontal (%)"
+
+    curve = pd.DataFrame(
+        {
+            "Separación (%)": percentages,
+            "Desviación estándar": deviations,
+        }
+    )
+    curve["Posición actual"] = curve["Separación (%)"] == current_percent
+    curve.attrs["axis_label"] = axis_label
+    curve.attrs["current_percent"] = current_percent
+    return curve
+
+
 uploaded = st.file_uploader(
     "Carga una imagen",
     type=["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"],
-    help="Se admiten imágenes a color. Los cálculos se hacen sobre la imagen completa, no sobre la vista reducida.",
+    help="Los cálculos se realizan con la resolución completa de la imagen.",
 )
 
 if uploaded is None:
     st.info("Carga una imagen para comenzar. Después podrás mover los dos ejes de la cuadrícula 2×2.")
     st.markdown(
         "**Cómo funciona:** el eje vertical determina la separación izquierda/derecha y el horizontal "
-        "determina la separación superior/inferior. Cada cambio vuelve a calcular las métricas."
+        "determina la separación superior/inferior. Cada cambio recalcula las métricas y la curva seleccionada."
     )
     st.stop()
 
@@ -139,25 +241,22 @@ with reset_col:
     st.write(" ")
     st.button("Centrar ejes", use_container_width=True, on_click=reset_axes)
 
-x_cut = int(round(image_width * x_percent / 100.0))
-y_cut = int(round(image_height * y_percent / 100.0))
-x_cut = max(1, min(image_width - 1, x_cut))
-y_cut = max(1, min(image_height - 1, y_cut))
-
-left_width = x_cut
-right_width = image_width - x_cut
-top_height = y_cut
-bottom_height = image_height - y_cut
+x_cut = int(np.clip(round(image_width * x_percent / 100.0), 1, image_width - 1))
+y_cut = int(np.clip(round(image_height * y_percent / 100.0), 1, image_height - 1))
 
 regions: list[tuple[str, np.ndarray]] = [
-    ("Superior izquierda", rgb[:y_cut, :x_cut]),
-    ("Superior derecha", rgb[:y_cut, x_cut:]),
-    ("Inferior izquierda", rgb[y_cut:, :x_cut]),
-    ("Inferior derecha", rgb[y_cut:, x_cut:]),
+    ("Cuadrícula 1 · Superior izquierda", rgb[:y_cut, :x_cut]),
+    ("Cuadrícula 2 · Superior derecha", rgb[:y_cut, x_cut:]),
+    ("Cuadrícula 3 · Inferior izquierda", rgb[y_cut:, :x_cut]),
+    ("Cuadrícula 4 · Inferior derecha", rgb[y_cut:, x_cut:]),
 ]
 
-# `region_metrics` uses the full image dimensions to calculate area percentages.
-metrics = pd.DataFrame([region_metrics(region, name) for name, region in regions])
+metrics = pd.DataFrame(
+    [
+        region_metrics(region, name, image_height, image_width)
+        for name, region in regions
+    ]
+)
 
 preview_col, info_col = st.columns([1.45, 1])
 with preview_col:
@@ -166,8 +265,7 @@ with preview_col:
     st.image(overlay, use_container_width=True)
     st.caption(
         f"Eje vertical: x = {x_cut} px ({x_percent} %) · "
-        f"Eje horizontal: y = {y_cut} px ({y_percent} %). "
-        "Las líneas rojas marcan los cortes."
+        f"Eje horizontal: y = {y_cut} px ({y_percent} %). Las líneas rojas marcan los cortes."
     )
 with info_col:
     st.subheader("Desviación estándar por región")
@@ -185,6 +283,68 @@ with info_col:
                 f"{row['Desv. estándar G']:.2f} / {row['Desv. estándar B']:.2f}"
             )
 
+st.subheader("Curva de desviación estándar")
+st.write(
+    "Elige una región y un eje para ver cómo variaría su desviación estándar al mover ese eje. "
+    "El otro eje se mantiene fijo en la posición indicada por su deslizador."
+)
+chart_control_col1, chart_control_col2 = st.columns(2)
+with chart_control_col1:
+    chart_axis = st.selectbox(
+        "Variable del eje horizontal de la gráfica",
+        ["Eje vertical", "Eje horizontal"],
+        index=0,
+    )
+with chart_control_col2:
+    chart_region_label = st.selectbox(
+        "Región que se desea analizar",
+        [name for name, _ in regions],
+        index=0,
+    )
+chart_region_number = [name for name, _ in regions].index(chart_region_label) + 1
+
+# The cumulative row/column sums make the 99-point curve much faster to calculate
+# than slicing and rescanning the full image for every possible slider position.
+luminance = get_luminance(rgb)
+curve = deviation_curve(luminance, chart_axis, chart_region_number, x_cut, y_cut)
+current_percent = curve.attrs["current_percent"]
+axis_label = curve.attrs["axis_label"]
+current_deviation = float(
+    curve.loc[curve["Separación (%)"] == current_percent, "Desviación estándar"].iloc[0]
+)
+
+line = alt.Chart(curve).mark_line().encode(
+    x=alt.X(
+        "Separación (%):Q",
+        title=axis_label,
+        scale=alt.Scale(domain=[1, 99]),
+    ),
+    y=alt.Y("Desviación estándar:Q", title="Desviación estándar de luminancia"),
+    tooltip=[
+        alt.Tooltip("Separación (%):Q", title="Separación (%)", format=".0f"),
+        alt.Tooltip("Desviación estándar:Q", title="Desviación estándar", format=".3f"),
+    ],
+)
+current_point = alt.Chart(curve[curve["Posición actual"]]).mark_point(
+    color="#dc2626", filled=True, size=90
+).encode(
+    x="Separación (%):Q",
+    y="Desviación estándar:Q",
+    tooltip=[
+        alt.Tooltip("Separación (%):Q", title="Posición actual (%)", format=".0f"),
+        alt.Tooltip("Desviación estándar:Q", title="Desviación actual", format=".3f"),
+    ],
+)
+current_rule = alt.Chart(pd.DataFrame({"Separación (%)": [current_percent]})).mark_rule(
+    color="#dc2626", strokeDash=[5, 4], opacity=0.8
+).encode(x="Separación (%):Q")
+chart = alt.layer(line, current_rule, current_point).properties(height=240).interactive()
+st.altair_chart(chart, use_container_width=True)
+st.caption(
+    f"Posición actual: {current_percent} % · Desviación estándar: {current_deviation:.3f}. "
+    "El punto rojo muestra la posición actual del deslizador."
+)
+
 st.subheader("Tabla comparativa")
 columns_to_show = [
     "Región", "Ancho (px)", "Alto (px)", "Píxeles", "Área (%)",
@@ -192,20 +352,20 @@ columns_to_show = [
     "Desv. estándar R", "Desv. estándar G", "Desv. estándar B",
 ]
 formatted = metrics[columns_to_show].copy()
-formatted["Área (%)"] = formatted["Área (%)"].map(lambda v: f"{v:.2f}")
-for col in [
+formatted["Área (%)"] = formatted["Área (%)"].map(lambda value: f"{value:.2f}")
+for column in [
     "Media luminancia", "Desv. estándar luminancia", "Mín. luminancia", "Máx. luminancia",
     "Desv. estándar R", "Desv. estándar G", "Desv. estándar B",
 ]:
-    formatted[col] = formatted[col].map(lambda v: f"{v:.3f}")
+    formatted[column] = formatted[column].map(lambda value: f"{value:.3f}")
 st.dataframe(formatted, hide_index=True, use_container_width=True)
 
 show_histograms = st.checkbox("Mostrar histogramas de luminancia por región", value=False)
 if show_histograms:
     histogram_data: dict[str, np.ndarray] = {}
     for name, region in regions:
-        luminance = np.clip(np.rint(get_luminance(region)), 0, 255).astype(np.uint8)
-        histogram_data[name] = np.bincount(luminance.ravel(), minlength=256)
+        region_luminance = np.clip(np.rint(get_luminance(region)), 0, 255).astype(np.uint8)
+        histogram_data[name] = np.bincount(region_luminance.ravel(), minlength=256)
     hist_df = pd.DataFrame(histogram_data, index=np.arange(256))
     hist_df.index.name = "Luminancia"
     st.line_chart(hist_df, x_label="Nivel de luminancia (0–255)", y_label="Cantidad de píxeles")
