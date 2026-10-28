@@ -233,11 +233,11 @@ def strongest_derivative_by_region(
         [row["Posición del cambio (%)"] for row in peak_rows], dtype=float
     )
     spread = float(np.std(peak_positions))
-    if spread < 20.0:
-        method = "Mediana (desviación < 20)"
+    if spread < 25.0:
+        method = "Mediana (desviación < 25)"
         summary_value = float(np.median(peak_positions))
     else:
-        method = "Media (desviación ≥ 20)"
+        method = "Media (desviación ≥ 25)"
         summary_value = float(np.mean(peak_positions))
 
     recommended_position = int(np.clip(np.rint(summary_value), 1, 99))
