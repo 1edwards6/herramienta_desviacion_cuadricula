@@ -313,6 +313,56 @@ current_deviation = float(
     curve.loc[curve["Separación (%)"] == current_percent, "Desviación estándar"].iloc[0]
 )
 
+# Aproximación numérica de la derivada: diferencia entre posiciones consecutivas
+# del deslizador, expresada en unidades de desviación estándar por punto porcentual.
+curve_sorted = curve.sort_values("Separación (%)").reset_index(drop=True)
+slider_positions = curve_sorted["Separación (%)"].to_numpy(dtype=float)
+deviation_values = curve_sorted["Desviación estándar"].to_numpy(dtype=float)
+derivative_values = np.diff(deviation_values) / np.diff(slider_positions)
+interval_starts = slider_positions[:-1]
+interval_ends = slider_positions[1:]
+interval_midpoints = (interval_starts + interval_ends) / 2.0
+midpoint_deviations = (deviation_values[:-1] + deviation_values[1:]) / 2.0
+
+max_positive_index = int(np.argmax(derivative_values))
+max_negative_index = int(np.argmin(derivative_values))
+steepest_index = int(np.argmax(np.abs(derivative_values)))
+
+def describe_derivative(index: int) -> str:
+    return (
+        f"{interval_starts[index]:.0f}–{interval_ends[index]:.0f} % "
+        f"(pendiente {derivative_values[index]:+.4f} por punto porcentual)"
+    )
+
+st.markdown("**Derivada aproximada de la curva**")
+derivative_col1, derivative_col2, derivative_col3 = st.columns(3)
+with derivative_col1:
+    st.metric(
+        "Mayor derivada positiva",
+        f"{derivative_values[max_positive_index]:+.4f}",
+        help="Mayor aumento de la desviación estándar entre dos posiciones consecutivas del deslizador.",
+    )
+    st.caption(f"Intervalo: {describe_derivative(max_positive_index)}")
+with derivative_col2:
+    st.metric(
+        "Cambio más brusco |derivada|",
+        f"{abs(derivative_values[steepest_index]):.4f}",
+        help="Mayor pendiente en valor absoluto; detecta tanto aumentos como descensos pronunciados.",
+    )
+    st.caption(f"Intervalo: {describe_derivative(steepest_index)}")
+with derivative_col3:
+    st.metric(
+        "Mayor derivada negativa",
+        f"{derivative_values[max_negative_index]:+.4f}",
+        help="Descenso más pronunciado de la desviación estándar.",
+    )
+    st.caption(f"Intervalo: {describe_derivative(max_negative_index)}")
+
+steepest_point_data = pd.DataFrame({
+    "Separación (%)": [interval_midpoints[steepest_index]],
+    "Desviación estándar": [midpoint_deviations[steepest_index]],
+    "Pendiente aproximada": [derivative_values[steepest_index]],
+})
 line = alt.Chart(curve).mark_line().encode(
     x=alt.X(
         "Separación (%):Q",
@@ -338,11 +388,38 @@ current_point = alt.Chart(curve[curve["Posición actual"]]).mark_point(
 current_rule = alt.Chart(pd.DataFrame({"Separación (%)": [current_percent]})).mark_rule(
     color="#dc2626", strokeDash=[5, 4], opacity=0.8
 ).encode(x="Separación (%):Q")
-chart = alt.layer(line, current_rule, current_point).properties(height=240).interactive()
+steepest_rule = alt.Chart(steepest_point_data).mark_rule(
+    color="#f59e0b", strokeDash=[4, 3], opacity=0.95
+).encode(
+    x="Separación (%):Q",
+    tooltip=[
+        alt.Tooltip("Separación (%):Q", title="Centro del intervalo (%)", format=".1f"),
+        alt.Tooltip("Pendiente aproximada:Q", title="Derivada aproximada", format="+.4f"),
+    ],
+)
+steepest_point = alt.Chart(steepest_point_data).mark_point(
+    color="#f59e0b", filled=True, size=110, shape="diamond"
+).encode(
+    x="Separación (%):Q",
+    y="Desviación estándar:Q",
+    tooltip=[
+        alt.Tooltip("Separación (%):Q", title="Centro del intervalo (%)", format=".1f"),
+        alt.Tooltip("Desviación estándar:Q", title="Desviación aproximada", format=".3f"),
+        alt.Tooltip("Pendiente aproximada:Q", title="Derivada aproximada", format="+.4f"),
+    ],
+)
+chart = alt.layer(
+    line, current_rule, current_point, steepest_rule, steepest_point
+).properties(height=240).interactive()
 st.altair_chart(chart, use_container_width=True)
 st.caption(
     f"Posición actual: {current_percent} % · Desviación estándar: {current_deviation:.3f}. "
-    "El punto rojo muestra la posición actual del deslizador."
+    "El punto rojo es la posición actual; el rombo naranja marca el intervalo con el cambio más brusco."
+)
+st.info(
+    "La derivada se aproxima con diferencias finitas entre posiciones consecutivas del deslizador. "
+    "Como la imagen tiene píxeles discretos y los cortes se redondean a píxeles, la curva también es discreta; "
+    "por eso el resultado identifica el intervalo de cambio más fuerte, no un punto exacto de una función continua."
 )
 
 st.subheader("Tabla comparativa")
